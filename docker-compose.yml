@@ -1,10 +1,14 @@
 services:
   telemetry-monitor:
     build:
-      context: ./telemetry_monitor
+      # context: ./telemetry_monitor
+      context: .
+      dockerfile: telemetry_monitor/Dockerfile
     container_name: refueling-telemetry-monitor
     ports:
       - "8000:8000"
+    environment:
+      RUNNING_IN_DOCKER: "true"
 
   prometheus:
     image: prom/prometheus
