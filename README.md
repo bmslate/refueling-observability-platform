@@ -372,7 +372,7 @@ scrape_configs:
   - job_name: "refueling-telemetry-monitor"
     static_configs:
       - targets:
-          - "host.docker.internal:8000"
+          - "telemetry-monitor:8000"
 ```
 
 Prometheus has been verified to:
