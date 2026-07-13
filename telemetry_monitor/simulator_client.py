@@ -1,7 +1,8 @@
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from queue import Empty, Queue
-from subprocess import PIPE, Popen
+from subprocess import PIPE, Popen, TimeoutExpired
 from threading import Thread
 import time
 
@@ -17,11 +18,11 @@ from telemetry_parser import parse_telemetry_line
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-# Docker Compose will later provide this environment variable:
+# Docker Compose provides this environment variable:
 #
 # RUNNING_IN_DOCKER=true
 #
-# When the variable is missing, this code assumes it is running locally
+# When the variable is missing, this code assumes that it is running locally
 # on Windows and uses controller.exe.
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
 
@@ -34,7 +35,7 @@ RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
 # Linux Docker container:
 # /controller/controller
 #
-# The Linux executable is compiled from controller.c by Dockerfile.
+# The Linux executable is compiled from controller.c by the Dockerfile.
 if RUNNING_IN_DOCKER:
     CONTROLLER_PATH = Path("/controller/controller")
 else:
@@ -45,60 +46,90 @@ def _read_stream(stream, output_queue: Queue[str]) -> None:
     """
     Continuously read controller stdout in a background thread.
 
-    The C controller keeps running and writes lines to stdout.
-    This thread reads each line and puts it into a Queue so the main
-    function can wait for telemetry without blocking on stream.readline().
+    The C controller stays alive while commands are being sent. This reader
+    places every output line into a Queue so the main thread can wait for
+    telemetry without blocking directly on stream.readline().
     """
     for line in iter(stream.readline, ""):
         output_queue.put(line.rstrip())
 
 
-def get_simulator_telemetry(command: str = "RESET") -> dict[str, str]:
+def _wait_for_telemetry(
+    output_queue: Queue[str],
+    command: str,
+    timeout_seconds: float = 5.0,
+) -> dict[str, str]:
     """
-    Run the C controller simulator once and return one parsed TLM telemetry line.
+    Wait for the next TLM line produced after one controller command.
 
-    Workflow:
-    1. Start the correct controller executable for the current environment.
-    2. Send a controller command such as RESET.
-    3. Read controller stdout.
-    4. Find the first line beginning with TLM,.
-    5. Parse the telemetry line into a dictionary.
-    6. Stop the controller process safely.
-
-    Example return value:
-    {
-        "STATE": "SAFE",
-        "ALIGN": "85",
-        "PRESSURE": "40",
-        "FUEL": "0",
-        "DOCK": "0",
-        "GATE": "CLOSED",
-        "FAULT": "NONE",
-    }
+    Controller output may also contain BOOT, INFO, ACK, ERR, FAULT, and LOG
+    lines. Those lines are intentionally skipped here because this function
+    returns only the machine-readable telemetry snapshot.
     """
+    deadline = time.time() + timeout_seconds
 
-    # Do not try to start the simulator if the executable is missing.
+    while time.time() < deadline:
+        try:
+            line = output_queue.get(timeout=0.5)
+
+            if line.startswith("TLM,"):
+                return parse_telemetry_line(line)
+
+        except Empty:
+            continue
+
+    raise TimeoutError(
+        "No telemetry line was received within "
+        f"{timeout_seconds:.1f} seconds for command: {command}"
+    )
+
+
+def get_simulator_telemetry_sequence(
+    commands: Sequence[str],
+) -> dict[str, str]:
+    """
+    Run one controller process, execute a command sequence, and return the
+    final parsed telemetry snapshot.
+
+    A single persistent controller process is used for the entire sequence so
+    state changes are preserved between commands.
+
+    Example pressure-high sequence:
+        [
+            "RESET",
+            "START_APPROACH",
+            "CHECK_ALIGNMENT",
+            "LOCK_DOCK",
+            "OPEN_GATE",
+            "CHECK_PRESSURE",
+            "START_REFUEL",
+            "SIM_PRESSURE 90",
+        ]
+
+    Expected final telemetry:
+        {
+            "STATE": "ABORT",
+            "ALIGN": "85",
+            "PRESSURE": "90",
+            "FUEL": "0",
+            "DOCK": "1",
+            "GATE": "CLOSED",
+            "FAULT": "PRESSURE_OUT_OF_RANGE",
+        }
+
+    Important:
+    - This is a controlled software-in-the-loop simulator workflow.
+    - Python observes and drives test commands only.
+    - Deterministic safety decisions remain inside controller.c.
+    """
+    if not commands:
+        raise ValueError("At least one controller command is required.")
+
     if not CONTROLLER_PATH.exists():
         raise FileNotFoundError(
             f"Controller executable was not found: {CONTROLLER_PATH}"
         )
 
-    # Start the C controller with pipes connected to stdin and stdout.
-    #
-    # stdin=PIPE:
-    #   Python can send commands such as RESET to the controller.
-    #
-    # stdout=PIPE:
-    #   Python can read controller output, including TLM telemetry lines.
-    #
-    # stderr=PIPE:
-    #   Reserved for future error logging and troubleshooting.
-    #
-    # text=True:
-    #   Read and write normal Python strings instead of bytes.
-    #
-    # bufsize=1:
-    #   Use line-buffered text I/O, which is useful for line-based telemetry.
     process = Popen(
         [str(CONTROLLER_PATH)],
         stdin=PIPE,
@@ -108,62 +139,83 @@ def get_simulator_telemetry(command: str = "RESET") -> dict[str, str]:
         bufsize=1,
     )
 
-    # Validate that the process streams were created successfully.
     if process.stdout is None or process.stdin is None:
         process.terminate()
         raise RuntimeError("Could not open controller input/output streams.")
 
-    # The Queue transfers output lines from the background reader thread
-    # to the main telemetry-reading loop.
     output_queue: Queue[str] = Queue()
 
-    # Start reading controller stdout in the background.
-    # daemon=True means this thread will not keep Python alive if the
-    # main program exits unexpectedly.
     Thread(
         target=_read_stream,
         args=(process.stdout, output_queue),
         daemon=True,
     ).start()
 
+    latest_telemetry: dict[str, str] | None = None
+
     try:
-        # Send one command to the controller, followed by a newline because
-        # the controller reads commands line by line.
-        process.stdin.write(f"{command}\n")
-        process.stdin.flush()
+        for command in commands:
+            normalized_command = command.strip()
 
-        # Wait up to 5 seconds for a telemetry line.
-        # This prevents the API from waiting forever if the controller fails.
-        deadline = time.time() + 5
+            if not normalized_command:
+                raise ValueError("Controller commands must not be empty.")
 
-        while time.time() < deadline:
-            try:
-                # Wait briefly for one new controller output line.
-                line = output_queue.get(timeout=0.5)
+            if process.poll() is not None:
+                raise RuntimeError(
+                    "Controller process stopped before the command sequence "
+                    f"completed. Next command was: {normalized_command}"
+                )
 
-                # A telemetry line starts with TLM, based on the controller protocol.
-                if line.startswith("TLM,"):
-                    # Convert raw text into a structured dictionary.
-                    return parse_telemetry_line(line)
+            # Send one command and wait for the telemetry snapshot produced
+            # by that same command-processing cycle before sending the next.
+            process.stdin.write(f"{normalized_command}\n")
+            process.stdin.flush()
 
-            except Empty:
-                # No line arrived during this short wait.
-                # Continue until the total 5-second deadline is reached.
-                continue
+            latest_telemetry = _wait_for_telemetry(
+                output_queue=output_queue,
+                command=normalized_command,
+            )
 
-        # The loop ended without receiving a TLM line.
-        raise TimeoutError(
-            "No telemetry line was received within 5 seconds "
-            f"for command: {command}"
-        )
+        if latest_telemetry is None:
+            raise RuntimeError("The controller returned no telemetry.")
+
+        return latest_telemetry
 
     finally:
-        # Always stop the C controller process, even if parsing or timeout fails.
+        # Always stop the temporary simulator process after the sequence ends.
         process.terminate()
 
         try:
-            # Give the process a few seconds to close normally.
             process.wait(timeout=5)
-        except TimeoutError:
-            # Force-stop only if normal termination did not work.
+        except TimeoutExpired:
             process.kill()
+            process.wait(timeout=5)
+
+
+def get_simulator_telemetry(command: str = "RESET") -> dict[str, str]:
+    """
+    Backward-compatible helper for callers that need only one command.
+
+    Existing code such as app.py can continue calling:
+        get_simulator_telemetry("RESET")
+    """
+    return get_simulator_telemetry_sequence([command])
+
+
+if __name__ == "__main__":
+    pressure_high_scenario = [
+        "RESET",
+        "START_APPROACH",
+        "CHECK_ALIGNMENT",
+        "LOCK_DOCK",
+        "OPEN_GATE",
+        "CHECK_PRESSURE",
+        "START_REFUEL",
+        "SIM_PRESSURE 90",
+    ]
+
+    result = get_simulator_telemetry_sequence(pressure_high_scenario)
+
+    print("Final pressure-high telemetry:")
+    for key, value in result.items():
+        print(f"{key}: {value}")

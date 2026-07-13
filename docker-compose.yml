@@ -9,6 +9,8 @@ services:
       - "8000:8000"
     environment:
       RUNNING_IN_DOCKER: "true"
+      # SIMULATOR_SCENARIO: "pressure_high"
+      SIMULATOR_SCENARIO: "reset"
 
   prometheus:
     image: prom/prometheus
