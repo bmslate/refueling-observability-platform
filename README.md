@@ -1,90 +1,122 @@
 # Refueling Safety Observability Platform
 
-A portfolio project that extends a C-based **Spacecraft Refueling Safety Simulation** into a local observability platform.
+A portfolio project that extends a deterministic C-based **Spacecraft Refueling Safety Simulation** into a local observability and incident-response platform.
 
-The project demonstrates how a deterministic safety-control system can be monitored through telemetry, Prometheus metrics, Grafana dashboards, Docker containers, incident runbooks, and an Agile-style GitHub workflow.
+The project demonstrates how a safety-oriented controller can be monitored through controller-generated telemetry, a Python telemetry adapter, Prometheus metrics, Grafana dashboards, Docker Compose, incident runbooks, and an Agile-style GitHub workflow.
 
-> This is a portfolio simulation only. It is not intended for real spacecraft operation.
+> This is a software-in-the-loop portfolio simulation. It is not intended for real spacecraft operation or hardware control.
 
 ---
 
 ## Current Status
 
-**Current stage: MVP Phase 1 — Local Observability**
+**Current stage: MVP Phase 1 — Local Observability (Sprint 1 closeout)**
 
 ### Completed
 
-- Imported and validated the original C-based refueling controller
+- Imported, built, and validated the original C refueling controller
+- Restored automatic safety checks during controller command processing
 - Created a Python FastAPI telemetry monitor
-- Added a `GET /health` endpoint
-- Added a Prometheus-compatible `GET /metrics` endpoint
-- Created refueling safety metrics with `prometheus-client`
+- Added `GET /health` and Prometheus-compatible `GET /metrics` endpoints
+- Added a telemetry parser for controller-generated `TLM` output
+- Added a simulator client that starts the C controller and exchanges commands through standard input and output
+- Added multi-command scenario execution within one controller process
 - Configured Prometheus to scrape telemetry every 5 seconds
-- Verified the Prometheus target is healthy and queryable
-- Built a Grafana dashboard for controller-health and telemetry visualization
-- Exported the Grafana dashboard JSON
+- Built a Grafana dashboard for controller health and telemetry visualization
+- Added Docker Compose for the telemetry monitor, Prometheus, and Grafana
+- Added persistent Grafana storage through a named Docker volume
+- Added selectable `reset` and `pressure_high` simulator scenarios
+- Verified the pressure-high safety-abort path
+- Added Grafana evidence for the faulted and recovered states
+- Added a pressure-high incident runbook
 - Used GitHub Issues, Projects, and sprint-style milestones to track development
 
 ### In Progress
 
-- Docker Compose deployment for the full local stack
-- Connecting the Python monitor to controller-generated telemetry
-- More realistic refueling-state simulation data
-- Incident runbooks and alert rules
+- Sprint 1 review and retrospective
+- Telemetry-timeout incident runbook
+- README and evidence cleanup
+
+### Planned Next
+
+- Persistent long-running simulator process
+- Background telemetry reader
+- Continuous telemetry updates instead of replaying a scenario on each scrape
+- Alert rules
+- Event-driven telemetry using MQTT or another pub/sub mechanism
 
 ---
 
 ## Project Background
 
-The original project was a spacecraft refueling safety simulation built around a C-based controller and Python-based supervision logic.
+The original project was a spacecraft refueling safety simulation built around a deterministic C controller.
 
-It focused on deterministic state transitions, telemetry output, fault detection, and safety abort behavior.
+The controller manages refueling states, validates operating conditions, emits telemetry, records fault events, and enters a safe abort state when a safety rule is violated.
 
-This project reuses that controller concept and extends it into an observability platform closer to real-world Cloud SRE and platform reliability workflows.
+This project extends that controller into an observability platform closer to real-world Cloud SRE and platform-reliability workflows.
 
 ---
 
-## Current MVP Architecture
+## Current Architecture
 
 ```text
-Current implementation
-
-Demo telemetry values
-        ↓
+Prometheus scrape request
+          ↓
 Python FastAPI Telemetry Monitor
-        ├── GET /health
-        └── GET /metrics
-                  ↓
+          ↓
+Scenario selector
+   ├── reset
+   └── pressure_high
+          ↓
+Python simulator client
+          ↓
+C Refueling Controller process
+          ↓
+Controller TLM output
+          ↓
+Telemetry parser
+          ↓
+Prometheus-compatible metrics
+          ↓
 Prometheus
-        ├── Scrapes metrics every 5 seconds
-        └── Stores time-series telemetry data
-                  ↓
+          ↓
 Grafana Dashboard
-        ├── Controller Health
-        ├── Fault Count
-        ├── Abort Count
-        ├── Telemetry Age
-        ├── Alignment Trend
-        └── Refueling Pressure Trend
 ```
 
-```text
-Planned integration
+The current implementation uses controller-generated telemetry rather than hard-coded demo metric values.
 
-C Refueling Controller / Simulator
-        ↓
-Telemetry parsing / exporting layer
-        ↓
-Python FastAPI Telemetry Monitor
-        ↓
-Prometheus + Grafana
-```
+For each `/metrics` scrape, the telemetry monitor currently:
 
-> The current telemetry monitor exports controlled demo values. Connecting it to controller-generated telemetry is planned work.
+1. Starts a new C controller process.
+2. Sends the command sequence for the selected scenario.
+3. Reads the controller telemetry output.
+4. Parses the final telemetry sample.
+5. Updates the Prometheus gauges.
+6. Terminates the controller process.
+
+> This is controlled software-in-the-loop telemetry. It is not continuous hardware telemetry.
 
 ---
 
-## Current Technology Stack
+## Safety-Control Boundary
+
+The deterministic C controller remains responsible for:
+
+- State transitions
+- Pressure validation
+- Alignment validation
+- Fault detection
+- Gate control
+- Abort behavior
+- Event logging
+
+The Python service, Prometheus, Grafana, and any future AI features only observe, export, visualize, or summarize controller behavior.
+
+AI does not control the refueling process and does not make safety-critical decisions.
+
+---
+
+## Technology Stack
 
 - C
 - Python
@@ -93,12 +125,13 @@ Prometheus + Grafana
 - Prometheus
 - Grafana
 - Docker
-- Git / GitHub
+- Docker Compose
+- Git and GitHub
 
 ### Planned Extensions
 
-- Docker Compose
-- MQTT / Pub-Sub telemetry
+- MQTT or another pub/sub telemetry layer
+- Alertmanager
 - AWS EC2, S3, CloudWatch, Lambda, and SNS
 - Kubernetes
 - Go health-check service
@@ -106,38 +139,124 @@ Prometheus + Grafana
 
 ---
 
-## Implemented Endpoints
+## Simulator Scenarios
 
-The Python telemetry monitor currently provides:
+The active simulator scenario is selected with the `SIMULATOR_SCENARIO` environment variable in `docker-compose.yml`.
+
+### Reset Scenario
+
+```yaml
+environment:
+  RUNNING_IN_DOCKER: "true"
+  SIMULATOR_SCENARIO: "reset"
+```
+
+Expected final state:
 
 ```text
-GET /health
-GET /metrics
+STATE=IDLE
+ALIGN=85
+PRESSURE=40
+FUEL=0
+DOCK=0
+GATE=CLOSED
+FAULT=NONE
 ```
+
+Expected dashboard indicators:
+
+- Controller Health: `HEALTHY`
+- Fault Count: `0`
+- Abort Count: `0`
+- Alignment: `85`
+- Pressure: `40`
+
+### Pressure-High Scenario
+
+```yaml
+environment:
+  RUNNING_IN_DOCKER: "true"
+  SIMULATOR_SCENARIO: "pressure_high"
+```
+
+The scenario executes:
+
+```text
+RESET
+START_APPROACH
+CHECK_ALIGNMENT
+LOCK_DOCK
+OPEN_GATE
+CHECK_PRESSURE
+START_REFUEL
+SIM_PRESSURE 90
+```
+
+The deterministic controller defines the safe pressure range as:
+
+```text
+Minimum safe pressure: 20
+Maximum safe pressure: 80
+```
+
+Injecting pressure `90` should produce:
+
+```text
+ACK,ABORT_ENTERING_SAFE_MODE,CAUSE=PRESSURE_OUT_OF_RANGE
+```
+
+Expected final telemetry:
+
+```text
+TLM,STATE=ABORT,ALIGN=85,PRESSURE=90,FUEL=0,DOCK=1,GATE=CLOSED,FAULT=PRESSURE_OUT_OF_RANGE
+```
+
+Expected safety behavior:
+
+- Controller state changes to `ABORT`
+- Refueling gate closes
+- Fault becomes `PRESSURE_OUT_OF_RANGE`
+- Event log records `ABORT_PRESSURE_OUT_OF_RANGE`
+
+---
+
+## Implemented Endpoints
 
 ### Health Endpoint
 
 ```text
-http://127.0.0.1:8000/health
+GET http://localhost:8000/health
 ```
 
-Example response:
+Example reset response:
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "simulator_scenario": "reset"
 }
 ```
+
+Example pressure-high response:
+
+```json
+{
+  "status": "ok",
+  "simulator_scenario": "pressure_high"
+}
+```
+
+The health endpoint reports whether the telemetry service is operating and identifies the selected scenario.
+
+A healthy telemetry service does not necessarily mean the controller has no active fault.
 
 ### Metrics Endpoint
 
 ```text
-http://127.0.0.1:8000/metrics
+GET http://localhost:8000/metrics
 ```
 
-The endpoint exposes Prometheus-compatible metrics.
-
-Example output:
+Example reset metrics:
 
 ```text
 refueling_alignment 85.0
@@ -151,41 +270,99 @@ refueling_controller_health 1.0
 refueling_telemetry_age_seconds 0.0
 ```
 
+Example pressure-high metrics:
+
+```text
+refueling_alignment 85.0
+refueling_pressure 90.0
+refueling_fuel_level 0.0
+refueling_docked 1.0
+refueling_gate_open 0.0
+refueling_fault_count 1.0
+refueling_abort_count 1.0
+refueling_controller_health 1.0
+refueling_telemetry_age_seconds 0.0
+```
+
 ---
 
 ## Implemented Metrics
 
 | Metric | Description |
 |---|---|
-| `refueling_alignment` | Simulated spacecraft-to-tanker alignment value |
-| `refueling_pressure` | Simulated refueling line pressure |
-| `refueling_fuel_level` | Simulated transferred fuel level |
-| `refueling_docked` | Docked state indicator |
-| `refueling_gate_open` | Refueling gate state indicator |
-| `refueling_fault_count` | Number of detected safety faults |
-| `refueling_abort_count` | Number of safety abort events |
-| `refueling_controller_health` | Controller health state: `1 = healthy`, `0 = unhealthy` |
-| `refueling_telemetry_age_seconds` | Age of the most recent telemetry update |
+| `refueling_alignment` | Latest controller-reported alignment value |
+| `refueling_pressure` | Latest controller-reported refueling pressure |
+| `refueling_fuel_level` | Latest controller-reported transferred fuel level |
+| `refueling_docked` | Docked-state indicator |
+| `refueling_gate_open` | Gate-open-state indicator |
+| `refueling_fault_count` | Current fault indicator: `1 = fault present`, `0 = no fault` |
+| `refueling_abort_count` | Current abort-state indicator: `1 = controller in ABORT`, `0 = not in ABORT` |
+| `refueling_controller_health` | Telemetry collection health: `1 = successful`, `0 = failed` |
+| `refueling_telemetry_age_seconds` | Simplified age of the latest collected telemetry sample |
+
+> Despite their current names, `refueling_fault_count` and `refueling_abort_count` are state indicators in this MVP, not cumulative event counters.
+
+---
+
+## Docker Compose Deployment
+
+The local stack contains:
+
+- `telemetry-monitor`
+- `prometheus`
+- `grafana`
+
+Start or rebuild the stack from the repository root:
+
+```powershell
+docker compose up -d --build
+```
+
+Check service status:
+
+```powershell
+docker compose ps
+```
+
+View telemetry-monitor logs:
+
+```powershell
+docker compose logs telemetry-monitor
+```
+
+Stop the stack:
+
+```powershell
+docker compose down
+```
+
+Grafana data is persisted in the named Docker volume:
+
+```yaml
+volumes:
+  grafana-data:
+```
+
+Local Grafana backup data is intentionally excluded from Git through `.gitignore`.
+
+---
+
+## Local Service URLs
+
+| Service | URL |
+|---|---|
+| FastAPI health | `http://localhost:8000/health` |
+| FastAPI metrics | `http://localhost:8000/metrics` |
+| FastAPI docs | `http://localhost:8000/docs` |
+| Prometheus | `http://localhost:9090` |
+| Prometheus targets | `http://localhost:9090/targets` |
+| Grafana | `http://localhost:3000` |
 
 ---
 
 ## Prometheus Integration
 
 Prometheus scrapes the telemetry monitor every five seconds.
-
-```text
-Python FastAPI /metrics
-        ↓
-Prometheus scrape
-        ↓
-Time-series storage
-        ↓
-Prometheus query interface
-        ↓
-Grafana visualization
-```
-
-Current Prometheus target configuration:
 
 ```yaml
 global:
@@ -202,16 +379,15 @@ Prometheus has been verified to:
 
 - Reach the FastAPI `/metrics` endpoint
 - Report the telemetry-monitor target as `UP`
-- Query refueling metrics such as `refueling_pressure` and `refueling_alignment`
-- Store metric history for time-series visualization
+- Query refueling metrics
+- Store time-series history
+- Supply dashboard data to Grafana
 
 ---
 
 ## Grafana Dashboard
 
-The Grafana dashboard currently visualizes the health and telemetry state of the refueling simulation.
-
-Dashboard panels include:
+The Grafana dashboard includes:
 
 - Controller Health
 - Fault Count
@@ -220,15 +396,48 @@ Dashboard panels include:
 - Alignment Trend
 - Refueling Pressure Trend
 
-The exported dashboard definition is stored at:
+Dashboard definition:
 
 ```text
 grafana/dashboards/refueling_safety_observability_dashboard.json
 ```
 
+### Pressure-High Evidence
+
+![Pressure-high simulator scenario](docs/images/grafana_simulator_mode_dashboard_PRESSURE_HIGH.png)
+
+### Recovered Reset Evidence
+
+![Recovered reset simulator scenario](docs/images/grafana_simulator_mode_dashboard_RESET.png)
+
+The pressure trend may retain recent historical values when switching scenarios because Prometheus stores time-series data across scrapes.
+
 ---
 
-## Current Repository Structure
+## Incident Runbook
+
+Pressure-high runbook:
+
+```text
+runbooks/pressure_high.md
+```
+
+The runbook documents:
+
+- Trigger condition
+- Expected controller response
+- Expected telemetry and metrics
+- Grafana indicators
+- Investigation commands
+- Safe recovery steps
+- Recovery verification
+- Current implementation limitations
+
+A telemetry-timeout runbook is planned.
+
+---
+
+## Repository Structure
 
 ```text
 refueling-observability-platform/
@@ -236,6 +445,9 @@ refueling-observability-platform/
 │   └── controller.c
 ├── telemetry_monitor/
 │   ├── app.py
+│   ├── simulator_client.py
+│   ├── telemetry_parser.py
+│   ├── Dockerfile
 │   └── requirements.txt
 ├── prometheus/
 │   └── prometheus.yml
@@ -243,142 +455,114 @@ refueling-observability-platform/
 │   └── dashboards/
 │       └── refueling_safety_observability_dashboard.json
 ├── docs/
-│   └── images/
+│   ├── images/
+│   │   ├── grafana_simulator_mode_dashboard_PRESSURE_HIGH.png
+│   │   └── grafana_simulator_mode_dashboard_RESET.png
+│   ├── sprint_reviews/
+│   └── retrospectives/
+├── runbooks/
+│   └── pressure_high.md
+├── docker-compose.yml
 ├── .gitignore
 └── README.md
 ```
 
-Planned additions include:
-
-- `docker-compose.yml`
-- `runbooks/`
-- `incidents/`
-- `diagrams/`
-- `docs/sprint_reviews/`
-- `docs/retrospectives/`
-
 ---
 
-## Local Development Setup
+## Manual Controller Verification
 
-### 1. Start the Python telemetry monitor
-
-```powershell
-cd telemetry_monitor
-.\.venv\Scripts\Activate.ps1
-python app.py
-```
-
-The telemetry monitor runs at:
-
-```text
-http://127.0.0.1:8000
-```
-
-Useful endpoints:
-
-```text
-http://127.0.0.1:8000/health
-http://127.0.0.1:8000/metrics
-http://127.0.0.1:8000/docs
-```
-
-### 2. Initial Prometheus Container Setup
-
-From the repository root:
+Run the C controller inside the telemetry-monitor container:
 
 ```powershell
-docker run --name refueling-prometheus -p 9090:9090 `
-  -v "${PWD}\prometheus\prometheus.yml:/etc/prometheus/prometheus.yml" `
-  prom/prometheus
+docker exec -it refueling-telemetry-monitor /controller/controller
 ```
 
-Open Prometheus:
+Then enter:
 
 ```text
-http://localhost:9090
+RESET
+START_APPROACH
+CHECK_ALIGNMENT
+LOCK_DOCK
+OPEN_GATE
+CHECK_PRESSURE
+START_REFUEL
+SIM_PRESSURE 90
+GET_STATUS
+GET_LOG
 ```
 
-### 3. Initial Grafana Container Setup
-
-```powershell
-docker run -d `
-  --name refueling-grafana `
-  -p 3000:3000 `
-  grafana/grafana
-```
-
-Open Grafana:
+Expected safety result:
 
 ```text
-http://localhost:3000
-```
-
-Default first-login credentials:
-
-```text
-Username: admin
-Password: admin
-```
-
-Grafana should use this Prometheus data source URL:
-
-```text
-http://host.docker.internal:9090
-```
-
-### 4. Start Existing Containers Later
-
-After containers have already been created, start them with:
-
-```powershell
-docker start refueling-prometheus
-docker start refueling-grafana
+STATE=ABORT
+PRESSURE=90
+GATE=CLOSED
+FAULT=PRESSURE_OUT_OF_RANGE
 ```
 
 ---
 
-## MVP Scope
+## Simulator Client Verification
+
+Run:
+
+```powershell
+docker exec refueling-telemetry-monitor python simulator_client.py
+```
+
+For the pressure-high test sequence, expected output includes:
+
+```text
+STATE: ABORT
+ALIGN: 85
+PRESSURE: 90
+FUEL: 0
+DOCK: 1
+GATE: CLOSED
+FAULT: PRESSURE_OUT_OF_RANGE
+```
+
+---
+
+## Current MVP Scope
 
 The current MVP includes:
 
-- C controller source code
-- Python FastAPI telemetry monitor
-- Health endpoint
-- Prometheus-compatible metrics endpoint
-- Prometheus metric scraping
+- Deterministic C controller
+- Controller-generated telemetry
+- Python telemetry parser and simulator client
+- FastAPI health and metrics endpoints
+- Prometheus scraping
 - Grafana dashboard
-- Docker-based Prometheus and Grafana services
+- Docker Compose local stack
+- Persistent Grafana named volume
+- Reset and pressure-high scenarios
+- Pressure-high incident evidence
+- Pressure-high incident runbook
 - GitHub Project Board and sprint-style workflow
 
-Remaining MVP work:
+Remaining MVP work includes:
 
-- Docker Compose deployment
-- Controller-to-monitor telemetry integration
-- Incident runbooks
+- Telemetry-timeout runbook
 - Alert rules
-- More realistic telemetry transitions
+- Sprint 1 review and retrospective
+- Persistent controller process
+- Continuous telemetry reader
+- More realistic time-based state transitions
 
 ---
 
-## Planned Incident Runbooks
+## Current Limitations
 
-Planned runbooks:
-
-```text
-runbooks/
-├── pressure_high.md
-└── telemetry_timeout.md
-```
-
-Each runbook will include:
-
-- Symptoms
-- Detection method
-- Metrics to check
-- Logs to check
-- Recovery steps
-- Verification steps
+- A new C controller process is started for each Prometheus scrape.
+- The selected simulator scenario is replayed for each scrape.
+- The system does not yet maintain one persistent controller process across scrapes.
+- Continuous background telemetry streaming is not yet implemented.
+- Fault and abort metrics are state indicators rather than cumulative counters.
+- Telemetry age is currently a simplified value.
+- Recovery from the pressure-high demo requires changing the scenario configuration and restarting the service.
+- The platform uses software-in-the-loop simulation rather than physical hardware telemetry.
 
 ---
 
@@ -386,9 +570,7 @@ Each runbook will include:
 
 This is a personal portfolio project and does not claim to use a full company-level Scrum process.
 
-Development is managed using GitHub Issues, GitHub Projects, and sprint-style milestones to simulate an Agile workflow.
-
-The workflow includes:
+Development is managed using GitHub Issues, GitHub Projects, and sprint-style milestones to simulate an Agile workflow, including:
 
 - Feature tickets
 - Bug reports
@@ -398,23 +580,17 @@ The workflow includes:
 - Retrospectives
 - Issue-to-commit tracking
 
-Recommended wording:
-
-```text
-Managed development using GitHub Issues, Projects, and sprint-style milestones to simulate an Agile workflow, including feature tickets, bug reports, incident tasks, sprint reviews, and retrospectives.
-```
-
 ---
 
 ## Future Roadmap
 
-### Phase 2 — Event-Driven Telemetry
+### Phase 2 — Continuous and Event-Driven Telemetry
 
+- Persistent simulator process
+- Background telemetry reader
 - MQTT broker
 - Telemetry publisher and consumer
-- Pub/sub topics
-- Fault and alert events
-- Incident event messages
+- Pub/sub fault and alert events
 
 Example topics:
 
@@ -466,10 +642,10 @@ AI tools may support:
 
 AI tools do not make safety-critical decisions.
 
-Abort behavior, fault detection, and state transitions remain deterministic and manually verified through builds, logs, metrics, dashboards, and repeatable test scenarios.
+Abort behavior, fault detection, gate control, and state transitions remain deterministic and are manually verified through repeatable commands, telemetry, logs, metrics, and dashboards.
 
 ---
 
 ## Related Project
 
-This project builds on my previous **Spacecraft Refueling Safety Simulation**, reusing the original C-based controller concept and extending it with telemetry monitoring, observability, incident-response workflows, and cloud-native reliability practices.
+This project builds on my previous **Spacecraft Refueling Safety Simulation**, reusing the original deterministic C controller and extending it with telemetry monitoring, observability, incident-response workflows, and cloud-native reliability practices.
