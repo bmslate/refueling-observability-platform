@@ -104,6 +104,7 @@ class PersistentSimulatorProcess:
 
         self._sample_sequence = 0
         self._last_telemetry_received_monotonic: float | None = None
+        self._latest_telemetry: TelemetrySample | None = None
         self._telemetry_parse_error_count = 0
         self._reader_failure: str | None = None
 
@@ -168,6 +169,25 @@ class PersistentSimulatorProcess:
         """Return the latest unexpected reader failure, if one occurred."""
         with self._state_lock:
             return self._reader_failure
+
+    def get_latest_telemetry(self) -> TelemetrySample | None:
+        """
+        Return the newest valid telemetry sample without consuming a queue.
+
+        A defensive copy of the telemetry dictionary is returned so callers
+        cannot modify the internal shared cache.
+        """
+        with self._state_lock:
+            sample = self._latest_telemetry
+
+            if sample is None:
+                return None
+
+            return TelemetrySample(
+                sequence=sample.sequence,
+                telemetry=dict(sample.telemetry),
+                received_monotonic=sample.received_monotonic,
+            )
 
     def is_running(self) -> bool:
         """Return True when the controller process is alive."""
@@ -288,8 +308,9 @@ class PersistentSimulatorProcess:
         """
         Return the next independently observed telemetry event.
 
-        This queue is separate from command-response handling. It is an event
-        stream, not the latest telemetry cache that will be added in Issue 3.
+        This queue is separate from command-response handling. Reading an
+        observed event removes it from this event stream. Use
+        get_latest_telemetry() for a non-consuming latest-value read.
         """
         if timeout_seconds < 0:
             raise ValueError("timeout_seconds must not be negative.")
@@ -380,6 +401,7 @@ class PersistentSimulatorProcess:
         with self._state_lock:
             self._sample_sequence = 0
             self._last_telemetry_received_monotonic = None
+            self._latest_telemetry = None
             self._telemetry_parse_error_count = 0
             self._reader_failure = None
 
@@ -428,13 +450,17 @@ class PersistentSimulatorProcess:
                         received_monotonic
                     )
 
-                sample = TelemetrySample(
-                    sequence=sequence,
-                    telemetry=telemetry,
-                    received_monotonic=received_monotonic,
-                )
+                    sample = TelemetrySample(
+                        sequence=sequence,
+                        telemetry=dict(telemetry),
+                        received_monotonic=received_monotonic,
+                    )
 
-                # Queueing the same immutable sample object is safe. Public
+                    # Update the cache only after the TLM line was parsed
+                    # successfully.
+                    self._latest_telemetry = sample
+
+                # Queueing the same internal sample object is safe. Public
                 # methods return copies of the dictionary to callers.
                 self._command_response_queue.put(sample)
                 self._telemetry_observation_queue.put(sample)
@@ -565,6 +591,9 @@ if __name__ == "__main__":
 
     simulator = PersistentSimulatorProcess()
 
+    if simulator.get_latest_telemetry() is not None:
+        raise RuntimeError("Latest telemetry cache was not initially empty.")
+
     try:
         simulator.start()
 
@@ -582,32 +611,98 @@ if __name__ == "__main__":
                 "Duplicate start() created a different reader thread."
             )
 
+        if simulator.get_latest_telemetry() is not None:
+            raise RuntimeError(
+                "Latest telemetry cache was not empty before the first sample."
+            )
+
+        reset_result = simulator.send_command("RESET")
+        latest_after_reset = simulator.get_latest_telemetry()
+
+        if latest_after_reset is None:
+            raise RuntimeError("RESET did not populate the latest telemetry cache.")
+
+        if latest_after_reset.telemetry != reset_result:
+            raise RuntimeError(
+                "Latest telemetry cache did not match the RESET response."
+            )
+
+        reset_cache_sequence = latest_after_reset.sequence
+
+        # Verify that callers cannot mutate the internal cache.
+        latest_after_reset.telemetry["STATE"] = "MUTATED_BY_CALLER"
+        latest_after_mutation = simulator.get_latest_telemetry()
+
+        if latest_after_mutation is None:
+            raise RuntimeError("Latest telemetry cache unexpectedly became empty.")
+
+        if latest_after_mutation.telemetry["STATE"] == "MUTATED_BY_CALLER":
+            raise RuntimeError(
+                "Caller mutation changed the internal latest telemetry cache."
+            )
+
         initial_sample_count = simulator.telemetry_sample_count
         result = simulator.send_commands(pressure_high_scenario)
         parsed_sample_count = (
             simulator.telemetry_sample_count - initial_sample_count
         )
 
+        latest_after_pressure_high = simulator.get_latest_telemetry()
+
+        if latest_after_pressure_high is None:
+            raise RuntimeError(
+                "Pressure-high scenario did not update the latest cache."
+            )
+
+        if latest_after_pressure_high.telemetry != result:
+            raise RuntimeError(
+                "Latest cache did not match final pressure-high telemetry."
+            )
+
+        if latest_after_pressure_high.sequence <= reset_cache_sequence:
+            raise RuntimeError(
+                "Latest cache sequence did not advance after new telemetry."
+            )
+
+        expected_final_fields = {
+            "STATE": "ABORT",
+            "PRESSURE": "90",
+            "GATE": "CLOSED",
+            "FAULT": "PRESSURE_OUT_OF_RANGE",
+        }
+
+        for key, expected_value in expected_final_fields.items():
+            actual_value = latest_after_pressure_high.telemetry.get(key)
+
+            if actual_value != expected_value:
+                raise RuntimeError(
+                    "Latest cache contained an unexpected final value: "
+                    f"{key}={actual_value!r}, expected {expected_value!r}"
+                )
+
+        expected_observed_events = 1 + len(pressure_high_scenario)
         observed_samples: list[TelemetrySample] = []
 
-        for _ in pressure_high_scenario:
+        for _ in range(expected_observed_events):
             sample = simulator.get_observed_telemetry(timeout_seconds=1.0)
 
             if sample is None:
                 raise RuntimeError(
-                    "The background telemetry observation queue did not "
-                    "receive all expected samples."
+                    "The telemetry observation queue did not receive all "
+                    "expected samples."
                 )
 
             observed_samples.append(sample)
 
         print(f"Controller PID: {simulator.pid}")
         print(f"Reader thread ID: {simulator.reader_thread_ident}")
-        print(f"Telemetry samples parsed: {parsed_sample_count}")
+        print(f"Telemetry samples parsed for scenario: {parsed_sample_count}")
         print(f"Observed telemetry events: {len(observed_samples)}")
-        print("Final pressure-high telemetry:")
+        print(f"Latest cache sequence: {latest_after_pressure_high.sequence}")
+        print("Defensive cache copy verified.")
+        print("Final pressure-high telemetry from latest cache:")
 
-        for key, value in result.items():
+        for key, value in latest_after_pressure_high.telemetry.items():
             print(f"{key}: {value}")
 
     finally:
@@ -616,4 +711,20 @@ if __name__ == "__main__":
     if simulator.reader_thread_alive:
         raise RuntimeError("Reader thread remained alive after stop().")
 
+    simulator.start()
+
+    try:
+        if simulator.get_latest_telemetry() is not None:
+            raise RuntimeError(
+                "Latest telemetry cache was not reset for a new lifecycle."
+            )
+
+        if simulator.telemetry_sample_count != 0:
+            raise RuntimeError(
+                "Telemetry sequence was not reset for a new lifecycle."
+            )
+    finally:
+        simulator.stop()
+
     print("Reader shutdown verified.")
+    print("Latest telemetry cache reset verified.")
