@@ -1,13 +1,12 @@
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 import uvicorn
 
-from simulator_client import (
-    get_simulator_telemetry,
-    get_simulator_telemetry_sequence,
-)
+from simulator_client import PersistentSimulatorProcess
 
 
 # Select the controlled software-in-the-loop scenario used by /metrics.
@@ -21,6 +20,11 @@ from simulator_client import (
 #
 # The default remains reset so the service starts in a safe scenario.
 SIMULATOR_SCENARIO = os.getenv("SIMULATOR_SCENARIO", "reset").strip().lower()
+
+SUPPORTED_SCENARIOS = {
+    "reset",
+    "pressure_high",
+}
 
 
 # Valid command sequence for the controlled pressure-high incident scenario.
@@ -39,9 +43,59 @@ PRESSURE_HIGH_COMMANDS = [
 ]
 
 
+# One shared simulator object belongs to this FastAPI process.
+#
+# lifespan() starts its C controller once when FastAPI starts and stops that
+# same controller once when FastAPI shuts down.
+PERSISTENT_SIMULATOR = PersistentSimulatorProcess()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """
+    Manage the C controller for the complete FastAPI service lifetime.
+
+    Startup:
+        Validate the configured scenario and start one controller process.
+
+    Shutdown:
+        Stop the same controller process safely.
+
+    Safety boundary:
+    - Python supervises the process and sends controlled simulator commands.
+    - Deterministic safety decisions remain inside controller.c.
+    """
+    if SIMULATOR_SCENARIO not in SUPPORTED_SCENARIOS:
+        supported_values = ", ".join(sorted(SUPPORTED_SCENARIOS))
+        raise RuntimeError(
+            "Unsupported SIMULATOR_SCENARIO: "
+            f"{SIMULATOR_SCENARIO!r}. "
+            f"Supported values are: {supported_values}."
+        )
+
+    PERSISTENT_SIMULATOR.start()
+
+    print(
+        "Persistent C controller started. "
+        f"PID={PERSISTENT_SIMULATOR.pid}"
+    )
+
+    try:
+        yield
+    finally:
+        previous_pid = PERSISTENT_SIMULATOR.pid
+        PERSISTENT_SIMULATOR.stop()
+
+        print(
+            "Persistent C controller stopped. "
+            f"Previous PID={previous_pid}"
+        )
+
+
 app = FastAPI(
     title="Refueling Safety Telemetry Monitor",
-    version="0.4.0",
+    version="0.5.0",
+    lifespan=lifespan,
 )
 
 
@@ -86,7 +140,7 @@ refueling_abort_count = Gauge(
 
 refueling_controller_health = Gauge(
     "refueling_controller_health",
-    "Controller health: 1 means healthy, 0 means unhealthy",
+    "Controller process health: 1 means running, 0 means unavailable",
 )
 
 refueling_telemetry_age_seconds = Gauge(
@@ -117,7 +171,7 @@ def convert_fault_to_count(fault_value: str) -> int:
 
 def collect_scenario_telemetry() -> dict[str, str]:
     """
-    Execute the selected simulator scenario and return final telemetry.
+    Execute the selected scenario through the existing controller process.
 
     reset:
         Sends RESET and returns safe-state telemetry.
@@ -125,17 +179,27 @@ def collect_scenario_telemetry() -> dict[str, str]:
     pressure_high:
         Executes a valid refueling sequence, injects pressure=90, and returns
         the ABORT telemetry produced by controller.c.
+
+    Important:
+    - This function does not create or terminate the controller process.
+    - The scenario is still replayed for every /metrics scrape.
+    - Background telemetry collection and caching belong to later Sprint 2
+      issues.
     """
+    if not PERSISTENT_SIMULATOR.is_running():
+        raise RuntimeError("Persistent controller process is not running.")
+
     if SIMULATOR_SCENARIO == "reset":
-        return get_simulator_telemetry("RESET")
+        return PERSISTENT_SIMULATOR.send_command("RESET")
 
     if SIMULATOR_SCENARIO == "pressure_high":
-        return get_simulator_telemetry_sequence(PRESSURE_HIGH_COMMANDS)
+        return PERSISTENT_SIMULATOR.send_commands(PRESSURE_HIGH_COMMANDS)
 
-    raise ValueError(
-        "Unsupported SIMULATOR_SCENARIO: "
-        f"{SIMULATOR_SCENARIO!r}. "
-        "Supported values are 'reset' and 'pressure_high'."
+    # lifespan() validates the value during startup. This defensive branch
+    # protects direct function calls in tests or future refactors.
+    raise RuntimeError(
+        "Unsupported SIMULATOR_SCENARIO reached telemetry collection: "
+        f"{SIMULATOR_SCENARIO!r}"
     )
 
 
@@ -143,11 +207,13 @@ def update_metrics_from_simulator() -> None:
     """
     Collect final telemetry from the selected scenario and update Gauges.
 
-    Current flow:
+    Current Sprint 2 Issue 1 flow:
 
-        selected scenario
+        FastAPI-owned persistent controller
             ->
-        controller.c
+        selected scenario commands
+            ->
+        controller.c safety logic
             ->
         TLM telemetry
             ->
@@ -172,6 +238,10 @@ def update_metrics_from_simulator() -> None:
         refueling_abort_count.set(1 if telemetry["STATE"] == "ABORT" else 0)
 
         refueling_controller_health.set(1)
+
+        # Telemetry is collected synchronously during this scrape, so its age
+        # is effectively zero here. A real continuously increasing telemetry
+        # age will be implemented with the later background-cache work.
         refueling_telemetry_age_seconds.set(0)
 
     except Exception:
@@ -180,24 +250,31 @@ def update_metrics_from_simulator() -> None:
 
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
+def health_check() -> dict[str, object]:
     """
-    Confirm that the FastAPI telemetry-monitor service is running.
+    Report FastAPI availability and persistent controller process status.
+
+    Process health and safety state are different concepts. A running
+    controller can still report a safety fault such as PRESSURE_OUT_OF_RANGE.
     """
+    controller_running = PERSISTENT_SIMULATOR.is_running()
+
     return {
-        "status": "ok",
+        "status": "ok" if controller_running else "degraded",
         "simulator_scenario": SIMULATOR_SCENARIO,
+        "controller_running": controller_running,
+        "controller_pid": PERSISTENT_SIMULATOR.pid,
     }
 
 
 @app.get("/metrics")
 def metrics() -> Response:
     """
-    Expose Prometheus-compatible metrics for the selected simulator scenario.
+    Expose Prometheus-compatible metrics using the persistent controller.
 
     Current limitation:
-    - A new controller process is started for each scrape.
-    - The selected scenario is replayed for every scrape.
+    - The controller process is persistent across scrapes.
+    - The selected scenario is still replayed for every scrape.
     - Continuous background telemetry streaming is not yet implemented.
     """
     update_metrics_from_simulator()

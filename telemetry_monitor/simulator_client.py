@@ -2,8 +2,8 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 from queue import Empty, Queue
-from subprocess import PIPE, Popen, TimeoutExpired
-from threading import Thread
+from subprocess import PIPE, STDOUT, Popen, TimeoutExpired
+from threading import RLock, Thread
 import time
 
 from telemetry_parser import parse_telemetry_line
@@ -42,163 +42,283 @@ else:
     CONTROLLER_PATH = PROJECT_ROOT / "controller" / "controller.exe"
 
 
-def _read_stream(stream, output_queue: Queue[str]) -> None:
+class PersistentSimulatorProcess:
     """
-    Continuously read controller stdout in a background thread.
+    Own one long-running C controller process.
 
-    The C controller stays alive while commands are being sent. This reader
-    places every output line into a Queue so the main thread can wait for
-    telemetry without blocking directly on stream.readline().
+    Calling start() more than once does not create duplicate processes.
+    Commands continue to use the same process until stop() is called.
+
+    Safety boundary:
+    - Python starts the simulator and sends controlled test commands.
+    - controller.c remains responsible for deterministic safety decisions.
     """
-    for line in iter(stream.readline, ""):
-        output_queue.put(line.rstrip())
 
+    def __init__(
+        self,
+        controller_path: Path = CONTROLLER_PATH,
+        telemetry_timeout_seconds: float = 5.0,
+    ) -> None:
+        if telemetry_timeout_seconds <= 0:
+            raise ValueError("telemetry_timeout_seconds must be greater than 0.")
 
-def _wait_for_telemetry(
-    output_queue: Queue[str],
-    command: str,
-    timeout_seconds: float = 5.0,
-) -> dict[str, str]:
-    """
-    Wait for the next TLM line produced after one controller command.
+        self._controller_path = controller_path
+        self._telemetry_timeout_seconds = telemetry_timeout_seconds
 
-    Controller output may also contain BOOT, INFO, ACK, ERR, FAULT, and LOG
-    lines. Those lines are intentionally skipped here because this function
-    returns only the machine-readable telemetry snapshot.
-    """
-    deadline = time.time() + timeout_seconds
+        self._process: Popen[str] | None = None
+        self._reader_thread: Thread | None = None
+        self._output_queue: Queue[str] = Queue()
 
-    while time.time() < deadline:
+        # Protect process startup and shutdown from concurrent calls.
+        self._lifecycle_lock = RLock()
+
+        # Protect command writes and complete command sequences.
+        #
+        # RLock is used because send_commands() locks the entire sequence and
+        # then calls send_command(), which obtains the same lock again from the
+        # same thread.
+        self._command_lock = RLock()
+
+    @property
+    def pid(self) -> int | None:
+        """Return the active controller PID, or None when it is not running."""
+        process = self._process
+
+        if process is None or process.poll() is not None:
+            return None
+
+        return process.pid
+
+    def is_running(self) -> bool:
+        """Return True when the controller process is alive."""
+        process = self._process
+        return process is not None and process.poll() is None
+
+    def start(self) -> None:
+        """
+        Start the controller process once.
+
+        This method is idempotent. Repeated calls while the controller is
+        already running return without creating another process.
+        """
+        with self._lifecycle_lock:
+            if self.is_running():
+                return
+
+            if not self._controller_path.exists():
+                raise FileNotFoundError(
+                    f"Controller executable was not found: {self._controller_path}"
+                )
+
+            # Use a fresh queue for every new process lifecycle so output left
+            # by an older process cannot be mistaken for current output.
+            self._output_queue = Queue()
+
+            process = Popen(
+                [str(self._controller_path)],
+                stdin=PIPE,
+                stdout=PIPE,
+                stderr=STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            if process.stdin is None or process.stdout is None:
+                process.terminate()
+                raise RuntimeError("Could not open controller input/output streams.")
+
+            self._process = process
+
+            self._reader_thread = Thread(
+                target=self._read_stream,
+                args=(process.stdout,),
+                name="controller-stdout-reader",
+                daemon=True,
+            )
+            self._reader_thread.start()
+
+    def send_command(self, command: str) -> dict[str, str]:
+        """
+        Send one command to the existing controller process.
+
+        The method waits for the next machine-readable TLM line and returns the
+        parsed telemetry snapshot generated by that command-processing cycle.
+        """
+        normalized_command = command.strip()
+
+        if not normalized_command:
+            raise ValueError("Controller command must not be empty.")
+
+        with self._command_lock:
+            process = self._process
+
+            if process is None:
+                raise RuntimeError(
+                    "Controller process has not been started. Call start() first."
+                )
+
+            return_code = process.poll()
+
+            if return_code is not None:
+                raise RuntimeError(
+                    "Controller process is not running. "
+                    f"Last return code: {return_code}"
+                )
+
+            if process.stdin is None:
+                raise RuntimeError("Controller stdin is unavailable.")
+
+            process.stdin.write(f"{normalized_command}\n")
+            process.stdin.flush()
+
+            return self._wait_for_telemetry(normalized_command)
+
+    def send_commands(
+        self,
+        commands: Sequence[str],
+    ) -> dict[str, str]:
+        """
+        Send a complete command sequence through the same controller process.
+
+        The command lock protects the entire sequence so a command from another
+        request cannot be inserted between scenario steps.
+        """
+        if not commands:
+            raise ValueError("At least one controller command is required.")
+
+        with self._command_lock:
+            latest_telemetry: dict[str, str] | None = None
+
+            for command in commands:
+                latest_telemetry = self.send_command(command)
+
+            if latest_telemetry is None:
+                raise RuntimeError("The controller returned no telemetry.")
+
+            return latest_telemetry
+
+    def stop(self) -> None:
+        """
+        Stop the controller safely.
+
+        Closing stdin first allows the controller's fgets loop to receive EOF
+        and exit normally. If it does not exit, terminate() and kill() are used
+        as bounded fallbacks.
+        """
+        with self._lifecycle_lock:
+            process = self._process
+            reader_thread = self._reader_thread
+
+            self._process = None
+            self._reader_thread = None
+
+            if process is None:
+                return
+
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+            try:
+                process.wait(timeout=2)
+            except TimeoutExpired:
+                process.terminate()
+
+                try:
+                    process.wait(timeout=3)
+                except TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+
+            if reader_thread is not None and reader_thread.is_alive():
+                reader_thread.join(timeout=1)
+
+    def _read_stream(self, stream) -> None:
+        """
+        Read controller output continuously and place each line in the queue.
+
+        A later Sprint 2 step will extend this reader so it also maintains the
+        latest telemetry cache and receive timestamp.
+        """
         try:
-            line = output_queue.get(timeout=0.5)
+            for line in iter(stream.readline, ""):
+                self._output_queue.put(line.rstrip())
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _wait_for_telemetry(self, command: str) -> dict[str, str]:
+        """
+        Wait for the next TLM line after a command.
+
+        BOOT, INFO, ACK, ERR, FAULT, and LOG lines are skipped because this
+        method returns only the machine-readable telemetry snapshot.
+        """
+        deadline = time.monotonic() + self._telemetry_timeout_seconds
+
+        while True:
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                break
+
+            process = self._process
+
+            if process is None:
+                raise RuntimeError(
+                    "Controller process was stopped while waiting for telemetry."
+                )
+
+            return_code = process.poll()
+
+            if return_code is not None and self._output_queue.empty():
+                raise RuntimeError(
+                    "Controller process exited while waiting for telemetry. "
+                    f"Return code: {return_code}; command: {command}"
+                )
+
+            try:
+                line = self._output_queue.get(timeout=min(0.5, remaining))
+            except Empty:
+                continue
 
             if line.startswith("TLM,"):
                 return parse_telemetry_line(line)
 
-        except Empty:
-            continue
+        raise TimeoutError(
+            "No telemetry line was received within "
+            f"{self._telemetry_timeout_seconds:.1f} seconds "
+            f"for command: {command}"
+        )
 
-    raise TimeoutError(
-        "No telemetry line was received within "
-        f"{timeout_seconds:.1f} seconds for command: {command}"
-    )
+    def __enter__(self) -> "PersistentSimulatorProcess":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.stop()
 
 
 def get_simulator_telemetry_sequence(
     commands: Sequence[str],
 ) -> dict[str, str]:
     """
-    Run one controller process, execute a command sequence, and return the
-    final parsed telemetry snapshot.
+    Backward-compatible helper.
 
-    A single persistent controller process is used for the entire sequence so
-    state changes are preserved between commands.
-
-    Example pressure-high sequence:
-        [
-            "RESET",
-            "START_APPROACH",
-            "CHECK_ALIGNMENT",
-            "LOCK_DOCK",
-            "OPEN_GATE",
-            "CHECK_PRESSURE",
-            "START_REFUEL",
-            "SIM_PRESSURE 90",
-        ]
-
-    Expected final telemetry:
-        {
-            "STATE": "ABORT",
-            "ALIGN": "85",
-            "PRESSURE": "90",
-            "FUEL": "0",
-            "DOCK": "1",
-            "GATE": "CLOSED",
-            "FAULT": "PRESSURE_OUT_OF_RANGE",
-        }
-
-    Important:
-    - This is a controlled software-in-the-loop simulator workflow.
-    - Python observes and drives test commands only.
-    - Deterministic safety decisions remain inside controller.c.
+    It creates one controller process for the supplied sequence and stops it
+    afterward. Existing app.py behavior remains unchanged until FastAPI owns
+    one shared PersistentSimulatorProcess instance.
     """
-    if not commands:
-        raise ValueError("At least one controller command is required.")
-
-    if not CONTROLLER_PATH.exists():
-        raise FileNotFoundError(
-            f"Controller executable was not found: {CONTROLLER_PATH}"
-        )
-
-    process = Popen(
-        [str(CONTROLLER_PATH)],
-        stdin=PIPE,
-        stdout=PIPE,
-        stderr=PIPE,
-        text=True,
-        bufsize=1,
-    )
-
-    if process.stdout is None or process.stdin is None:
-        process.terminate()
-        raise RuntimeError("Could not open controller input/output streams.")
-
-    output_queue: Queue[str] = Queue()
-
-    Thread(
-        target=_read_stream,
-        args=(process.stdout, output_queue),
-        daemon=True,
-    ).start()
-
-    latest_telemetry: dict[str, str] | None = None
-
-    try:
-        for command in commands:
-            normalized_command = command.strip()
-
-            if not normalized_command:
-                raise ValueError("Controller commands must not be empty.")
-
-            if process.poll() is not None:
-                raise RuntimeError(
-                    "Controller process stopped before the command sequence "
-                    f"completed. Next command was: {normalized_command}"
-                )
-
-            # Send one command and wait for the telemetry snapshot produced
-            # by that same command-processing cycle before sending the next.
-            process.stdin.write(f"{normalized_command}\n")
-            process.stdin.flush()
-
-            latest_telemetry = _wait_for_telemetry(
-                output_queue=output_queue,
-                command=normalized_command,
-            )
-
-        if latest_telemetry is None:
-            raise RuntimeError("The controller returned no telemetry.")
-
-        return latest_telemetry
-
-    finally:
-        # Always stop the temporary simulator process after the sequence ends.
-        process.terminate()
-
-        try:
-            process.wait(timeout=5)
-        except TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+    with PersistentSimulatorProcess() as simulator:
+        return simulator.send_commands(commands)
 
 
 def get_simulator_telemetry(command: str = "RESET") -> dict[str, str]:
-    """
-    Backward-compatible helper for callers that need only one command.
-
-    Existing code such as app.py can continue calling:
-        get_simulator_telemetry("RESET")
-    """
+    """Backward-compatible helper for one controller command."""
     return get_simulator_telemetry_sequence([command])
 
 
@@ -214,8 +334,20 @@ if __name__ == "__main__":
         "SIM_PRESSURE 90",
     ]
 
-    result = get_simulator_telemetry_sequence(pressure_high_scenario)
+    with PersistentSimulatorProcess() as simulator:
+        first_pid = simulator.pid
 
-    print("Final pressure-high telemetry:")
-    for key, value in result.items():
-        print(f"{key}: {value}")
+        # Calling start() again must not create a second process.
+        simulator.start()
+        second_pid = simulator.pid
+
+        if first_pid != second_pid:
+            raise RuntimeError("Duplicate start() created a different process.")
+
+        result = simulator.send_commands(pressure_high_scenario)
+
+        print(f"Controller PID: {simulator.pid}")
+        print("Final pressure-high telemetry:")
+
+        for key, value in result.items():
+            print(f"{key}: {value}")
