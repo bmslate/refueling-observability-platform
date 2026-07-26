@@ -1,10 +1,12 @@
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from subprocess import PIPE, STDOUT, Popen, TimeoutExpired
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 import time
+from typing import TextIO
 
 from telemetry_parser import parse_telemetry_line
 
@@ -42,15 +44,37 @@ else:
     CONTROLLER_PATH = PROJECT_ROOT / "controller" / "controller.exe"
 
 
+@dataclass(frozen=True, slots=True)
+class TelemetrySample:
+    """
+    One telemetry event parsed by the background stdout reader.
+
+    sequence:
+        Increasing sample number for the current controller lifecycle.
+
+    telemetry:
+        Parsed TLM fields returned by telemetry_parser.py.
+
+    received_monotonic:
+        Local monotonic timestamp recorded when the sample was accepted.
+    """
+
+    sequence: int
+    telemetry: dict[str, str]
+    received_monotonic: float
+
+
 class PersistentSimulatorProcess:
     """
-    Own one long-running C controller process.
+    Own one long-running C controller process and one stdout reader thread.
 
-    Calling start() more than once does not create duplicate processes.
-    Commands continue to use the same process until stop() is called.
+    Calling start() repeatedly does not create duplicate processes or duplicate
+    reader threads. Commands continue to use the same process until stop() is
+    called.
 
     Safety boundary:
-    - Python starts the simulator and sends controlled test commands.
+    - Python starts and supervises the simulator process.
+    - Python sends controlled test commands and observes controller output.
     - controller.c remains responsible for deterministic safety decisions.
     """
 
@@ -67,17 +91,33 @@ class PersistentSimulatorProcess:
 
         self._process: Popen[str] | None = None
         self._reader_thread: Thread | None = None
-        self._output_queue: Queue[str] = Queue()
+        self._stop_requested = Event()
 
-        # Protect process startup and shutdown from concurrent calls.
+        # Command-response telemetry and independently observed telemetry use
+        # separate queues. This prevents future cache consumers from removing
+        # samples that send_command() is waiting for.
+        self._command_response_queue: Queue[TelemetrySample] = Queue()
+        self._telemetry_observation_queue: Queue[TelemetrySample] = Queue()
+
+        # Non-TLM output and malformed TLM diagnostics are kept separately.
+        self._diagnostic_queue: Queue[str] = Queue()
+
+        self._sample_sequence = 0
+        self._last_telemetry_received_monotonic: float | None = None
+        self._telemetry_parse_error_count = 0
+        self._reader_failure: str | None = None
+
+        # Protect process startup and shutdown.
         self._lifecycle_lock = RLock()
 
         # Protect command writes and complete command sequences.
         #
-        # RLock is used because send_commands() locks the entire sequence and
-        # then calls send_command(), which obtains the same lock again from the
-        # same thread.
+        # RLock is required because send_commands() protects the full sequence
+        # and calls send_command(), which obtains the same lock again.
         self._command_lock = RLock()
+
+        # Protect reader-owned state inspected by other threads.
+        self._state_lock = RLock()
 
     @property
     def pid(self) -> int | None:
@@ -89,6 +129,46 @@ class PersistentSimulatorProcess:
 
         return process.pid
 
+    @property
+    def reader_thread_alive(self) -> bool:
+        """Return True while the background stdout reader is alive."""
+        reader_thread = self._reader_thread
+        return reader_thread is not None and reader_thread.is_alive()
+
+    @property
+    def reader_thread_ident(self) -> int | None:
+        """Return the background reader thread identifier when available."""
+        reader_thread = self._reader_thread
+
+        if reader_thread is None:
+            return None
+
+        return reader_thread.ident
+
+    @property
+    def telemetry_sample_count(self) -> int:
+        """Return the number of valid TLM samples parsed in this lifecycle."""
+        with self._state_lock:
+            return self._sample_sequence
+
+    @property
+    def last_telemetry_received_monotonic(self) -> float | None:
+        """Return the receive timestamp of the most recent valid telemetry."""
+        with self._state_lock:
+            return self._last_telemetry_received_monotonic
+
+    @property
+    def telemetry_parse_error_count(self) -> int:
+        """Return the number of malformed TLM lines rejected by the reader."""
+        with self._state_lock:
+            return self._telemetry_parse_error_count
+
+    @property
+    def reader_failure(self) -> str | None:
+        """Return the latest unexpected reader failure, if one occurred."""
+        with self._state_lock:
+            return self._reader_failure
+
     def is_running(self) -> bool:
         """Return True when the controller process is alive."""
         process = self._process
@@ -96,10 +176,10 @@ class PersistentSimulatorProcess:
 
     def start(self) -> None:
         """
-        Start the controller process once.
+        Start one controller process and one background reader thread.
 
-        This method is idempotent. Repeated calls while the controller is
-        already running return without creating another process.
+        This method is idempotent. Repeated calls while the process is already
+        running return without creating another process or reader thread.
         """
         with self._lifecycle_lock:
             if self.is_running():
@@ -110,9 +190,7 @@ class PersistentSimulatorProcess:
                     f"Controller executable was not found: {self._controller_path}"
                 )
 
-            # Use a fresh queue for every new process lifecycle so output left
-            # by an older process cannot be mistaken for current output.
-            self._output_queue = Queue()
+            self._reset_lifecycle_state()
 
             process = Popen(
                 [str(self._controller_path)],
@@ -139,10 +217,8 @@ class PersistentSimulatorProcess:
 
     def send_command(self, command: str) -> dict[str, str]:
         """
-        Send one command to the existing controller process.
-
-        The method waits for the next machine-readable TLM line and returns the
-        parsed telemetry snapshot generated by that command-processing cycle.
+        Send one command and wait for the next telemetry sample produced after
+        the command was written.
         """
         normalized_command = command.strip()
 
@@ -168,20 +244,28 @@ class PersistentSimulatorProcess:
             if process.stdin is None:
                 raise RuntimeError("Controller stdin is unavailable.")
 
+            # Ignore telemetry already observed before this command.
+            minimum_sequence = self.telemetry_sample_count + 1
+
             process.stdin.write(f"{normalized_command}\n")
             process.stdin.flush()
 
-            return self._wait_for_telemetry(normalized_command)
+            sample = self._wait_for_command_telemetry(
+                command=normalized_command,
+                minimum_sequence=minimum_sequence,
+            )
+
+            return dict(sample.telemetry)
 
     def send_commands(
         self,
         commands: Sequence[str],
     ) -> dict[str, str]:
         """
-        Send a complete command sequence through the same controller process.
+        Send a complete sequence through the same controller process.
 
-        The command lock protects the entire sequence so a command from another
-        request cannot be inserted between scenario steps.
+        The lock covers the entire sequence so another request cannot insert a
+        command between scenario steps.
         """
         if not commands:
             raise ValueError("At least one controller command is required.")
@@ -197,67 +281,200 @@ class PersistentSimulatorProcess:
 
             return latest_telemetry
 
+    def get_observed_telemetry(
+        self,
+        timeout_seconds: float = 0.0,
+    ) -> TelemetrySample | None:
+        """
+        Return the next independently observed telemetry event.
+
+        This queue is separate from command-response handling. It is an event
+        stream, not the latest telemetry cache that will be added in Issue 3.
+        """
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must not be negative.")
+
+        try:
+            if timeout_seconds == 0:
+                sample = self._telemetry_observation_queue.get_nowait()
+            else:
+                sample = self._telemetry_observation_queue.get(
+                    timeout=timeout_seconds
+                )
+        except Empty:
+            return None
+
+        return TelemetrySample(
+            sequence=sample.sequence,
+            telemetry=dict(sample.telemetry),
+            received_monotonic=sample.received_monotonic,
+        )
+
+    def get_diagnostic_line(self, timeout_seconds: float = 0.0) -> str | None:
+        """Return the next BOOT/INFO/ACK/ERR/FAULT/LOG diagnostic line."""
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must not be negative.")
+
+        try:
+            if timeout_seconds == 0:
+                return self._diagnostic_queue.get_nowait()
+
+            return self._diagnostic_queue.get(timeout=timeout_seconds)
+        except Empty:
+            return None
+
     def stop(self) -> None:
         """
-        Stop the controller safely.
+        Stop the controller and wait for the reader thread to exit.
 
         Closing stdin first allows the controller's fgets loop to receive EOF
-        and exit normally. If it does not exit, terminate() and kill() are used
-        as bounded fallbacks.
+        and exit normally. terminate() and kill() are bounded fallbacks.
         """
-        with self._lifecycle_lock:
-            process = self._process
-            reader_thread = self._reader_thread
+        # Wait for an in-flight command or sequence before shutting down.
+        with self._command_lock:
+            with self._lifecycle_lock:
+                process = self._process
+                reader_thread = self._reader_thread
 
-            self._process = None
-            self._reader_thread = None
+                if process is None:
+                    return
 
-            if process is None:
-                return
+                self._stop_requested.set()
 
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-
-            try:
-                process.wait(timeout=2)
-            except TimeoutExpired:
-                process.terminate()
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
 
                 try:
-                    process.wait(timeout=3)
+                    process.wait(timeout=2)
                 except TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
+                    process.terminate()
 
-            if reader_thread is not None and reader_thread.is_alive():
-                reader_thread.join(timeout=1)
+                    try:
+                        process.wait(timeout=3)
+                    except TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
 
-    def _read_stream(self, stream) -> None:
+                if reader_thread is not None:
+                    reader_thread.join(timeout=2)
+
+                    if reader_thread.is_alive():
+                        raise RuntimeError(
+                            "Controller stdout reader did not stop cleanly."
+                        )
+
+                self._process = None
+                self._reader_thread = None
+
+    def _reset_lifecycle_state(self) -> None:
+        """Create clean queues and state for a new controller lifecycle."""
+        self._stop_requested.clear()
+
+        self._command_response_queue = Queue()
+        self._telemetry_observation_queue = Queue()
+        self._diagnostic_queue = Queue()
+
+        with self._state_lock:
+            self._sample_sequence = 0
+            self._last_telemetry_received_monotonic = None
+            self._telemetry_parse_error_count = 0
+            self._reader_failure = None
+
+    def _read_stream(self, stream: TextIO) -> None:
         """
-        Read controller output continuously and place each line in the queue.
+        Read and classify controller stdout for the entire process lifetime.
 
-        A later Sprint 2 step will extend this reader so it also maintains the
-        latest telemetry cache and receive timestamp.
+        This is the only method allowed to call readline() on controller stdout.
+        Valid TLM lines are parsed once and then routed to two independent
+        queues:
+
+        - command-response queue
+        - telemetry-observation queue
+
+        Non-TLM lines are routed to the diagnostic queue.
         """
         try:
-            for line in iter(stream.readline, ""):
-                self._output_queue.put(line.rstrip())
+            for raw_line in iter(stream.readline, ""):
+                line = raw_line.rstrip()
+
+                if not line:
+                    continue
+
+                if not line.startswith("TLM,"):
+                    self._diagnostic_queue.put(line)
+                    continue
+
+                try:
+                    telemetry = parse_telemetry_line(line)
+                except (ValueError, KeyError) as exc:
+                    with self._state_lock:
+                        self._telemetry_parse_error_count += 1
+
+                    self._diagnostic_queue.put(
+                        f"TELEMETRY_PARSE_ERROR,{type(exc).__name__}:{exc},"
+                        f"RAW={line}"
+                    )
+                    continue
+
+                received_monotonic = time.monotonic()
+
+                with self._state_lock:
+                    self._sample_sequence += 1
+                    sequence = self._sample_sequence
+                    self._last_telemetry_received_monotonic = (
+                        received_monotonic
+                    )
+
+                sample = TelemetrySample(
+                    sequence=sequence,
+                    telemetry=telemetry,
+                    received_monotonic=received_monotonic,
+                )
+
+                # Queueing the same immutable sample object is safe. Public
+                # methods return copies of the dictionary to callers.
+                self._command_response_queue.put(sample)
+                self._telemetry_observation_queue.put(sample)
+
+        except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+
+            with self._state_lock:
+                self._reader_failure = failure
+
+            self._diagnostic_queue.put(f"READER_FAILURE,{failure}")
+
         finally:
             try:
                 stream.close()
             except OSError:
                 pass
 
-    def _wait_for_telemetry(self, command: str) -> dict[str, str]:
-        """
-        Wait for the next TLM line after a command.
+            if not self._stop_requested.is_set():
+                process = self._process
 
-        BOOT, INFO, ACK, ERR, FAULT, and LOG lines are skipped because this
-        method returns only the machine-readable telemetry snapshot.
-        """
+                if process is not None and process.poll() is None:
+                    failure = (
+                        "Controller stdout reached EOF while the process "
+                        "was still running."
+                    )
+
+                    with self._state_lock:
+                        self._reader_failure = failure
+
+                    self._diagnostic_queue.put(
+                        f"READER_FAILURE,{failure}"
+                    )
+
+    def _wait_for_command_telemetry(
+        self,
+        command: str,
+        minimum_sequence: int,
+    ) -> TelemetrySample:
+        """Wait for the first command-response sample after a sequence number."""
         deadline = time.monotonic() + self._telemetry_timeout_seconds
 
         while True:
@@ -265,6 +482,14 @@ class PersistentSimulatorProcess:
 
             if remaining <= 0:
                 break
+
+            reader_failure = self.reader_failure
+
+            if reader_failure is not None:
+                raise RuntimeError(
+                    "Background telemetry reader failed while waiting for "
+                    f"command {command!r}: {reader_failure}"
+                )
 
             process = self._process
 
@@ -275,19 +500,24 @@ class PersistentSimulatorProcess:
 
             return_code = process.poll()
 
-            if return_code is not None and self._output_queue.empty():
+            if (
+                return_code is not None
+                and self._command_response_queue.empty()
+            ):
                 raise RuntimeError(
                     "Controller process exited while waiting for telemetry. "
                     f"Return code: {return_code}; command: {command}"
                 )
 
             try:
-                line = self._output_queue.get(timeout=min(0.5, remaining))
+                sample = self._command_response_queue.get(
+                    timeout=min(0.5, remaining)
+                )
             except Empty:
                 continue
 
-            if line.startswith("TLM,"):
-                return parse_telemetry_line(line)
+            if sample.sequence >= minimum_sequence:
+                return sample
 
         raise TimeoutError(
             "No telemetry line was received within "
@@ -310,8 +540,7 @@ def get_simulator_telemetry_sequence(
     Backward-compatible helper.
 
     It creates one controller process for the supplied sequence and stops it
-    afterward. Existing app.py behavior remains unchanged until FastAPI owns
-    one shared PersistentSimulatorProcess instance.
+    afterward. FastAPI should use one shared PersistentSimulatorProcess.
     """
     with PersistentSimulatorProcess() as simulator:
         return simulator.send_commands(commands)
@@ -334,20 +563,57 @@ if __name__ == "__main__":
         "SIM_PRESSURE 90",
     ]
 
-    with PersistentSimulatorProcess() as simulator:
-        first_pid = simulator.pid
+    simulator = PersistentSimulatorProcess()
 
-        # Calling start() again must not create a second process.
+    try:
         simulator.start()
-        second_pid = simulator.pid
 
-        if first_pid != second_pid:
+        first_pid = simulator.pid
+        first_reader_ident = simulator.reader_thread_ident
+
+        # Repeated start() calls must not create a new process or reader.
+        simulator.start()
+
+        if first_pid != simulator.pid:
             raise RuntimeError("Duplicate start() created a different process.")
 
+        if first_reader_ident != simulator.reader_thread_ident:
+            raise RuntimeError(
+                "Duplicate start() created a different reader thread."
+            )
+
+        initial_sample_count = simulator.telemetry_sample_count
         result = simulator.send_commands(pressure_high_scenario)
+        parsed_sample_count = (
+            simulator.telemetry_sample_count - initial_sample_count
+        )
+
+        observed_samples: list[TelemetrySample] = []
+
+        for _ in pressure_high_scenario:
+            sample = simulator.get_observed_telemetry(timeout_seconds=1.0)
+
+            if sample is None:
+                raise RuntimeError(
+                    "The background telemetry observation queue did not "
+                    "receive all expected samples."
+                )
+
+            observed_samples.append(sample)
 
         print(f"Controller PID: {simulator.pid}")
+        print(f"Reader thread ID: {simulator.reader_thread_ident}")
+        print(f"Telemetry samples parsed: {parsed_sample_count}")
+        print(f"Observed telemetry events: {len(observed_samples)}")
         print("Final pressure-high telemetry:")
 
         for key, value in result.items():
             print(f"{key}: {value}")
+
+    finally:
+        simulator.stop()
+
+    if simulator.reader_thread_alive:
+        raise RuntimeError("Reader thread remained alive after stop().")
+
+    print("Reader shutdown verified.")
