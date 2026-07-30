@@ -2,14 +2,15 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 import uvicorn
 
-from simulator_client import PersistentSimulatorProcess
+from simulator_client import PersistentSimulatorProcess, TelemetrySample
 
 
-# Select the controlled software-in-the-loop scenario used by /metrics.
+# Select the controlled software-in-the-loop scenario used to initialize the
+# latest telemetry cache when FastAPI starts.
 #
 # Supported values:
 #   reset
@@ -18,7 +19,7 @@ from simulator_client import PersistentSimulatorProcess
 # Docker Compose can override this with:
 #   SIMULATOR_SCENARIO=pressure_high
 #
-# The default remains reset so the service starts in a safe scenario.
+# The default remains reset so the service starts from a safe scenario.
 SIMULATOR_SCENARIO = os.getenv("SIMULATOR_SCENARIO", "reset").strip().lower()
 
 SUPPORTED_SCENARIOS = {
@@ -50,16 +51,44 @@ PRESSURE_HIGH_COMMANDS = [
 PERSISTENT_SIMULATOR = PersistentSimulatorProcess()
 
 
+def run_initial_scenario() -> None:
+    """
+    Execute the configured simulator scenario once during FastAPI startup.
+
+    The background telemetry reader parses the resulting TLM lines and updates
+    the latest telemetry cache. Prometheus scrapes do not execute scenarios.
+    """
+    if not PERSISTENT_SIMULATOR.is_running():
+        raise RuntimeError("Persistent controller process is not running.")
+
+    if SIMULATOR_SCENARIO == "reset":
+        PERSISTENT_SIMULATOR.send_command("RESET")
+        return
+
+    if SIMULATOR_SCENARIO == "pressure_high":
+        PERSISTENT_SIMULATOR.send_commands(PRESSURE_HIGH_COMMANDS)
+        return
+
+    # The lifespan function validates the value before calling this function.
+    raise RuntimeError(
+        "Unsupported SIMULATOR_SCENARIO reached initialization: "
+        f"{SIMULATOR_SCENARIO!r}"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     Manage the C controller for the complete FastAPI service lifetime.
 
     Startup:
-        Validate the configured scenario and start one controller process.
+        1. Validate the configured scenario.
+        2. Start one persistent controller process.
+        3. Run the configured scenario once.
+        4. Verify that the latest telemetry cache was populated.
 
     Shutdown:
-        Stop the same controller process safely.
+        Stop the same controller process and reader thread safely.
 
     Safety boundary:
     - Python supervises the process and sends controlled simulator commands.
@@ -75,13 +104,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     PERSISTENT_SIMULATOR.start()
 
-    print(
-        "Persistent C controller started. "
-        f"PID={PERSISTENT_SIMULATOR.pid}"
-    )
-
     try:
+        run_initial_scenario()
+
+        initial_sample = PERSISTENT_SIMULATOR.get_latest_telemetry()
+
+        if initial_sample is None:
+            raise RuntimeError(
+                "The initial simulator scenario completed without populating "
+                "the latest telemetry cache."
+            )
+
+        print(
+            "Persistent C controller started and telemetry cache initialized. "
+            f"PID={PERSISTENT_SIMULATOR.pid}, "
+            f"scenario={SIMULATOR_SCENARIO}, "
+            f"sequence={initial_sample.sequence}"
+        )
+
         yield
+
     finally:
         previous_pid = PERSISTENT_SIMULATOR.pid
         PERSISTENT_SIMULATOR.stop()
@@ -94,7 +136,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Refueling Safety Telemetry Monitor",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -169,115 +211,96 @@ def convert_fault_to_count(fault_value: str) -> int:
     return 0 if fault_value == "NONE" else 1
 
 
-def collect_scenario_telemetry() -> dict[str, str]:
+def update_metrics_from_cache(sample: TelemetrySample) -> None:
     """
-    Execute the selected scenario through the existing controller process.
+    Update Prometheus Gauges from one cached telemetry sample.
 
-    reset:
-        Sends RESET and returns safe-state telemetry.
-
-    pressure_high:
-        Executes a valid refueling sequence, injects pressure=90, and returns
-        the ABORT telemetry produced by controller.c.
-
-    Important:
-    - This function does not create or terminate the controller process.
-    - The scenario is still replayed for every /metrics scrape.
-    - Background telemetry collection and caching belong to later Sprint 2
-      issues.
+    This function does not send controller commands and does not consume the
+    telemetry observation queue.
     """
-    if not PERSISTENT_SIMULATOR.is_running():
-        raise RuntimeError("Persistent controller process is not running.")
+    telemetry = sample.telemetry
 
-    if SIMULATOR_SCENARIO == "reset":
-        return PERSISTENT_SIMULATOR.send_command("RESET")
+    refueling_alignment.set(float(telemetry["ALIGN"]))
+    refueling_pressure.set(float(telemetry["PRESSURE"]))
+    refueling_fuel_level.set(float(telemetry["FUEL"]))
+    refueling_docked.set(float(telemetry["DOCK"]))
 
-    if SIMULATOR_SCENARIO == "pressure_high":
-        return PERSISTENT_SIMULATOR.send_commands(PRESSURE_HIGH_COMMANDS)
+    refueling_gate_open.set(convert_gate_to_number(telemetry["GATE"]))
+    refueling_fault_count.set(convert_fault_to_count(telemetry["FAULT"]))
+    refueling_abort_count.set(1 if telemetry["STATE"] == "ABORT" else 0)
 
-    # lifespan() validates the value during startup. This defensive branch
-    # protects direct function calls in tests or future refactors.
-    raise RuntimeError(
-        "Unsupported SIMULATOR_SCENARIO reached telemetry collection: "
-        f"{SIMULATOR_SCENARIO!r}"
+    refueling_controller_health.set(
+        1 if PERSISTENT_SIMULATOR.is_running() else 0
     )
 
-
-def update_metrics_from_simulator() -> None:
-    """
-    Collect final telemetry from the selected scenario and update Gauges.
-
-    Current Sprint 2 Issue 1 flow:
-
-        FastAPI-owned persistent controller
-            ->
-        selected scenario commands
-            ->
-        controller.c safety logic
-            ->
-        TLM telemetry
-            ->
-        simulator_client.py
-            ->
-        telemetry_parser.py
-            ->
-        Prometheus Gauges
-            ->
-        Grafana
-    """
-    try:
-        telemetry = collect_scenario_telemetry()
-
-        refueling_alignment.set(float(telemetry["ALIGN"]))
-        refueling_pressure.set(float(telemetry["PRESSURE"]))
-        refueling_fuel_level.set(float(telemetry["FUEL"]))
-        refueling_docked.set(float(telemetry["DOCK"]))
-
-        refueling_gate_open.set(convert_gate_to_number(telemetry["GATE"]))
-        refueling_fault_count.set(convert_fault_to_count(telemetry["FAULT"]))
-        refueling_abort_count.set(1 if telemetry["STATE"] == "ABORT" else 0)
-
-        refueling_controller_health.set(1)
-
-        # Telemetry is collected synchronously during this scrape, so its age
-        # is effectively zero here. A real continuously increasing telemetry
-        # age will be implemented with the later background-cache work.
-        refueling_telemetry_age_seconds.set(0)
-
-    except Exception:
-        refueling_controller_health.set(0)
-        raise
+    # Real telemetry age will be calculated from received_monotonic in Issue 4.
+    refueling_telemetry_age_seconds.set(0)
 
 
 @app.get("/health")
 def health_check() -> dict[str, object]:
     """
-    Report FastAPI availability and persistent controller process status.
+    Report FastAPI, controller, reader, and telemetry-cache status.
 
-    Process health and safety state are different concepts. A running
-    controller can still report a safety fault such as PRESSURE_OUT_OF_RANGE.
+    Process health, telemetry availability, and controller safety state are
+    intentionally reported as separate concepts.
     """
     controller_running = PERSISTENT_SIMULATOR.is_running()
+    reader_running = PERSISTENT_SIMULATOR.reader_thread_alive
+    latest_sample = PERSISTENT_SIMULATOR.get_latest_telemetry()
+    telemetry_available = latest_sample is not None
+    reader_failure = PERSISTENT_SIMULATOR.reader_failure
+
+    healthy = (
+        controller_running
+        and reader_running
+        and telemetry_available
+        and reader_failure is None
+    )
 
     return {
-        "status": "ok" if controller_running else "degraded",
+        "status": "ok" if healthy else "degraded",
         "simulator_scenario": SIMULATOR_SCENARIO,
         "controller_running": controller_running,
         "controller_pid": PERSISTENT_SIMULATOR.pid,
+        "reader_running": reader_running,
+        "reader_failure": reader_failure,
+        "telemetry_available": telemetry_available,
+        "telemetry_sequence": (
+            latest_sample.sequence if latest_sample is not None else None
+        ),
     }
 
 
 @app.get("/metrics")
 def metrics() -> Response:
     """
-    Expose Prometheus-compatible metrics using the persistent controller.
+    Expose Prometheus-compatible metrics from the latest telemetry cache.
 
-    Current limitation:
-    - The controller process is persistent across scrapes.
-    - The selected scenario is still replayed for every scrape.
-    - Continuous background telemetry streaming is not yet implemented.
+    Prometheus scrapes do not:
+    - start or restart the controller
+    - send RESET
+    - replay the pressure-high sequence
+    - consume telemetry observation events
     """
-    update_metrics_from_simulator()
+    controller_running = PERSISTENT_SIMULATOR.is_running()
+    refueling_controller_health.set(1 if controller_running else 0)
+
+    latest_sample = PERSISTENT_SIMULATOR.get_latest_telemetry()
+
+    if latest_sample is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Latest controller telemetry is not available.",
+        )
+
+    try:
+        update_metrics_from_cache(latest_sample)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Latest controller telemetry is invalid: {exc}",
+        ) from exc
 
     return Response(
         content=generate_latest(),
